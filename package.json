@@ -6,12 +6,18 @@
   "scripts": {
     "dev": "vite --port 5178",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "ios:sync": "npm run build && cap sync ios",
+    "ios:open": "npm run ios:sync && cap open ios"
   },
   "dependencies": {
+    "@capacitor/core": "^8.4.1",
+    "@capacitor/ios": "^8.4.1",
+    "@mediapipe/tasks-vision": "^0.10.35",
     "three": "^0.183.2"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.4.1",
     "vite": "^6.0.0"
   }
 }

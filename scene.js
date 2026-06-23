@@ -8,6 +8,63 @@ import {
 import { ao } from 'three/examples/jsm/tsl/display/GTAONode.js';
 import { HDRLoader } from 'three/examples/jsm/loaders/HDRLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { createGestureInput } from './gestureInput.js';
+
+function getViewportSize() {
+  const viewport = window.visualViewport;
+  return {
+    width: Math.max(1, Math.round(viewport?.width ?? window.innerWidth)),
+    height: Math.max(1, Math.round(viewport?.height ?? window.innerHeight))
+  };
+}
+
+function isMobileViewport() {
+  const { width, height } = getViewportSize();
+  return window.matchMedia('(pointer: coarse)').matches && Math.min(width, height) <= 820;
+}
+
+function getMaxPixelRatio() {
+  return isMobileViewport() ? 1.5 : 2;
+}
+
+function getNormalizedPointer(clientX, clientY) {
+  const { width, height } = getViewportSize();
+  return {
+    x: (clientX / width) * 2 - 1,
+    y: (clientY / height) * 2 - 1
+  };
+}
+
+function showWebGPUUnsupported(error) {
+  const message = document.createElement('div');
+  message.style.cssText = `
+    position: fixed; inset: 0; z-index: 100000; display: grid; place-items: center;
+    padding: 24px; background: #000; color: #fff; font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif;
+    text-align: center;
+  `;
+  const details = error ? `<p style="opacity:0.5;font-size:12px;margin-top:14px;">${String(error.message || error)}</p>` : '';
+  message.innerHTML = `
+    <div style="max-width:360px;">
+      <h1 style="font-size:22px;margin-bottom:12px;">WebGPU required</h1>
+      <p style="font-size:15px;line-height:1.5;opacity:0.78;">This 3D game needs a browser with WebGPU enabled. On iPhone, use Safari on iOS 26 or newer.</p>
+      ${details}
+    </div>
+  `;
+  document.body.appendChild(message);
+}
+
+if (!navigator.gpu) {
+  showWebGPUUnsupported();
+  throw new Error('WebGPU is not available in this browser.');
+}
+
+window.addEventListener('error', (event) => {
+  showWebGPUUnsupported(event.error || event.message || 'Unknown runtime error');
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  showWebGPUUnsupported(event.reason || 'Unhandled promise rejection');
+});
 
 // Render layers
 const LAYER_DEFAULT = 0;
@@ -18,18 +75,26 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x000000);
 scene.fog = new THREE.FogExp2(0x000000, 0.045);
 
-const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+const initialViewport = getViewportSize();
+const camera = new THREE.PerspectiveCamera(60, initialViewport.width / initialViewport.height, 0.1, 100);
 camera.position.set(0, 8, 10);
 camera.lookAt(0, 0, 0);
 
 const renderer = new THREE.WebGPURenderer({ antialias: true });
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(initialViewport.width, initialViewport.height);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, getMaxPixelRatio()));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const root = document.getElementById('root') ?? document.body;
 root.appendChild(renderer.domElement);
-await renderer.init();
+renderer.domElement.id = 'canvas';
+renderer.domElement.setAttribute('aria-label', '3D air hockey game');
+try {
+  await renderer.init();
+} catch (error) {
+  showWebGPUUnsupported(error);
+  throw error;
+}
 
 // Orbit controls (disabled by default, toggle with F key)
 const orbitControls = new OrbitControls(camera, renderer.domElement);
@@ -57,9 +122,9 @@ const ssrNormalClean = normalPass;
 
 // GTAO (ambient occlusion)
 const aoPass = ao(depthPass, normalPass, camera);
-aoPass.resolutionScale = 0.4;
+aoPass.resolutionScale = isMobileViewport() ? 0.3 : 0.4;
 aoPass.thickness.value = 2;
-aoPass.samples.value = 6;
+aoPass.samples.value = isMobileViewport() ? 4 : 6;
 aoPass.distanceExponent.value = 1.5;
 
 const aoTexture = aoPass.getTextureNode().r;
@@ -259,7 +324,8 @@ const dirLight = new THREE.DirectionalLight(0xaaddff, 1.2);
 dirLight.name = 'directionalLight1';
 dirLight.position.set(4, 14, 6);
 dirLight.castShadow = true;
-dirLight.shadow.mapSize.set(1024, 1024);
+const shadowMapSize = isMobileViewport() ? 512 : 1024;
+dirLight.shadow.mapSize.set(shadowMapSize, shadowMapSize);
 dirLight.shadow.camera.left = -10;
 dirLight.shadow.camera.right = 10;
 dirLight.shadow.camera.top = 10;
@@ -646,42 +712,161 @@ function serve() {
 const keys = { a: false, d: false, w: false, s: false, left: false, right: false, space: false, f: false };
 let mouseX = 0;
 let mouseY = 0;
+let pointerX = 0;
+let pointerY = 0;
+let gestureX = 0;
+let gestureY = 0;
+let lastGesturePointAt = -Infinity;
 let useMouseControl = true;
+let activeControlSource = 'pointer';
+let interactionMode = 'gesture';
 let scrollDelta = 0;
+const GESTURE_CONTROL_TIMEOUT = 700;
+
+function isGameUiEvent(event) {
+  return Boolean(event.target?.closest?.('[data-game-ui], input, button, select, textarea'));
+}
+
+function isGestureControlActive(now = performance.now()) {
+  return interactionMode === 'gesture' && now - lastGesturePointAt <= GESTURE_CONTROL_TIMEOUT;
+}
+
+function setControlPoint(x, y, source = 'pointer') {
+  const nextX = THREE.MathUtils.clamp(x, -1, 1);
+  const nextY = THREE.MathUtils.clamp(y, -1, 1);
+
+  if (source === 'gesture') {
+    gestureX = nextX;
+    gestureY = nextY;
+    lastGesturePointAt = performance.now();
+    if (interactionMode !== 'gesture') return;
+  } else {
+    pointerX = nextX;
+    pointerY = nextY;
+  }
+
+  useMouseControl = true;
+  syncAnalogControlPoint();
+}
+
+function syncAnalogControlPoint(now = performance.now()) {
+  if (!useMouseControl) return;
+
+  const gestureActive = isGestureControlActive(now);
+  mouseX = gestureActive ? gestureX : pointerX;
+  mouseY = gestureActive ? gestureY : pointerY;
+  activeControlSource = gestureActive ? 'gesture' : 'pointer';
+}
+
+function runPrimaryGameAction() {
+  if (gameState.waitingForPlayerServe) {
+    gameState.waitingForPlayerServe = false;
+    serve();
+    return true;
+  }
+  if (gameState.matchOver) {
+    resetMatch();
+    serve();
+    return true;
+  }
+  if (gameState.gameOver) {
+    startNextSet();
+    return true;
+  }
+  if (gameState.paused && gameState.serverIsPlayer) {
+    serve();
+    return true;
+  }
+  return false;
+}
+
+// iOS/WebKit starts Web Audio in a suspended state until a direct user gesture.
+// Keep this tiny and call it from every first-touch style entry point.
+function unlockAudio() {
+  try {
+    const ctx = getAudioCtx();
+    if (ctx.state === 'suspended') {
+      void ctx.resume().then(() => updateAudioStatus('unlocked'));
+    } else {
+      updateAudioStatus('ready');
+    }
+  } catch (e) {
+    // Audio may be unavailable in unsupported webviews; gameplay should continue.
+    updateAudioStatus('unavailable');
+  }
+}
+
+let audioCtx = null;
+let audioStatusEl = null;
+function updateAudioStatus(prefix = 'audio') {
+  if (!audioStatusEl) return;
+  if (!audioCtx) {
+    audioStatusEl.textContent = `${prefix}: not started`;
+    return;
+  }
+  audioStatusEl.textContent = `${prefix}: ${audioCtx.state}, ${audioCtx.sampleRate || '--'} Hz`;
+}
+
+async function playAudioTestTone() {
+  try {
+    const ctx = getAudioCtx();
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+
+    const t = ctx.currentTime + 0.02;
+    const master = ctx.createGain();
+    master.gain.setValueAtTime(0.0001, t);
+    master.gain.exponentialRampToValueAtTime(0.8, t + 0.03);
+    master.gain.exponentialRampToValueAtTime(0.0001, t + 0.8);
+    master.connect(ctx.destination);
+
+    const low = ctx.createOscillator();
+    low.type = 'sine';
+    low.frequency.setValueAtTime(440, t);
+    low.frequency.exponentialRampToValueAtTime(660, t + 0.8);
+    low.connect(master);
+    low.start(t);
+    low.stop(t + 0.85);
+
+    const high = ctx.createOscillator();
+    high.type = 'triangle';
+    high.frequency.setValueAtTime(880, t);
+    high.frequency.exponentialRampToValueAtTime(1320, t + 0.8);
+    high.connect(master);
+    high.start(t);
+    high.stop(t + 0.85);
+
+    window.navigator?.vibrate?.(35);
+    setTimeout(() => updateAudioStatus('played test'), 80);
+  } catch (e) {
+    updateAudioStatus('test failed');
+  }
+}
 
 window.addEventListener('keydown', (e) => {
+  unlockAudio();
   const key = e.key.toLowerCase();
   if (key === 'a' || key === 'arrowleft') { keys.a = true; useMouseControl = false; }
   if (key === 'd' || key === 'arrowright') { keys.d = true; useMouseControl = false; }
-  if (key === 'w' || key === 'arrowup') { keys.w = true; }
-  if (key === 's' || key === 'arrowdown') { keys.s = true; }
+  if (key === 'w' || key === 'arrowup') { keys.w = true; useMouseControl = false; activeControlSource = 'keyboard'; }
+  if (key === 's' || key === 'arrowdown') { keys.s = true; useMouseControl = false; activeControlSource = 'keyboard'; }
   if (key === 'f') {
     freeOrbitMode = !freeOrbitMode;
     orbitControls.enabled = freeOrbitMode;
     if (freeOrbitMode) {
       orbitControls.target.set(0, 0.5, 0);
-      showMessage('Free orbit on — press F to exit', 2000);
+      showMessage('自由视角已开启 — 按 F 退出', 2000);
     } else {
       // Reset camera to default position
       camera.position.set(0, 8, 10);
       camera.lookAt(0, 0.5, 0);
-      showMessage('Free orbit off', 1000);
+      showMessage('自由视角已关闭', 1000);
     }
   }
   if (key === ' ') {
     keys.space = true;
-    if (gameState.waitingForPlayerServe) {
-      gameState.waitingForPlayerServe = false;
-      serve();
-    } else if (gameState.matchOver) {
-      resetMatch();
-      serve();
-    } else if (gameState.gameOver) {
-      // Set over, start next set
-      startNextSet();
-    } else if (gameState.paused && gameState.serverIsPlayer) {
-      serve();
-    }
+    runPrimaryGameAction();
   }
   if (key === ' ') keys.space = true;
 });
@@ -696,31 +881,15 @@ window.addEventListener('keyup', (e) => {
 });
 
 window.addEventListener('mousemove', (e) => {
-  mouseX = (e.clientX / window.innerWidth) * 2 - 1;
-  mouseY = (e.clientY / window.innerHeight) * 2 - 1; // -1 top, 1 bottom
-  useMouseControl = true;
+  if (isGameUiEvent(e)) return;
+  const pointer = getNormalizedPointer(e.clientX, e.clientY);
+  setControlPoint(pointer.x, pointer.y, 'pointer');
 });
 
 window.addEventListener('mousedown', (e) => {
-  if (gameState.waitingForPlayerServe) {
-    gameState.waitingForPlayerServe = false;
-    serve();
-    return;
-  }
-  if (gameState.matchOver) {
-    resetMatch();
-    serve();
-    return;
-  }
-  if (gameState.gameOver) {
-    startNextSet();
-    return;
-  }
-  // Don't allow mouse click to serve when it's AI's turn
-  if (gameState.paused && gameState.serverIsPlayer) {
-    serve();
-    return;
-  }
+  if (isGameUiEvent(e)) return;
+  unlockAudio();
+  runPrimaryGameAction();
 });
 
 // Touch support
@@ -731,34 +900,25 @@ window.addEventListener('wheel', (e) => {
 }, { passive: true });
 
 window.addEventListener('touchmove', (e) => {
+  if (isGameUiEvent(e)) return;
   e.preventDefault();
   const touch = e.touches[0];
-  mouseX = (touch.clientX / window.innerWidth) * 2 - 1;
-  mouseY = (touch.clientY / window.innerHeight) * 2 - 1;
-  useMouseControl = true;
+  if (!touch) return;
+  const pointer = getNormalizedPointer(touch.clientX, touch.clientY);
+  setControlPoint(pointer.x, pointer.y, 'pointer');
 }, { passive: false });
 
 window.addEventListener('touchstart', (e) => {
-  if (gameState.waitingForPlayerServe) {
-    gameState.waitingForPlayerServe = false;
-    serve();
-    return;
+  if (isGameUiEvent(e)) return;
+  e.preventDefault();
+  unlockAudio();
+  const touch = e.touches[0];
+  if (touch) {
+    const pointer = getNormalizedPointer(touch.clientX, touch.clientY);
+    setControlPoint(pointer.x, pointer.y, 'pointer');
   }
-  if (gameState.matchOver) {
-    resetMatch();
-    serve();
-    return;
-  }
-  if (gameState.gameOver) {
-    startNextSet();
-    return;
-  }
-  // Don't allow touch to serve when it's AI's turn
-  if (gameState.paused && gameState.serverIsPlayer) {
-    serve();
-    return;
-  }
-});
+  runPrimaryGameAction();
+}, { passive: false });
 
 // UI
 const uiContainer = document.createElement('div');
@@ -775,41 +935,57 @@ fontLink.rel = 'stylesheet';
 document.head.appendChild(fontLink);
 
 // Settings panel
-const settingsBtn = document.createElement('div');
+const settingsBtn = document.createElement('button');
+settingsBtn.type = 'button';
 settingsBtn.style.cssText = `
-  position: fixed; top: 16px; right: 16px; width: 36px; height: 36px;
+  position: fixed; top: calc(16px + env(safe-area-inset-top)); right: calc(16px + env(safe-area-inset-right)); width: 40px; height: 40px;
   border: 1px solid rgba(255,255,255,0.15); border-radius: 8px;
   display: flex; align-items: center; justify-content: center;
-  cursor: pointer; pointer-events: all; z-index: 100;
+  cursor: pointer; pointer-events: all; z-index: 10001; padding: 0;
   background: rgba(10,10,18,0.8); color: #888; font-size: 18px;
   font-family: 'Inter', sans-serif; transition: border-color 0.2s, color 0.2s;
   backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  -webkit-appearance: none; appearance: none; touch-action: manipulation;
 `;
 settingsBtn.textContent = '⚙';
-settingsBtn.style.display = 'none';
+settingsBtn.dataset.gameUi = 'true';
+settingsBtn.style.display = 'flex';
 settingsBtn.addEventListener('mouseenter', () => { settingsBtn.style.borderColor = 'rgba(255,255,255,0.35)'; settingsBtn.style.color = '#ccc'; });
 settingsBtn.addEventListener('mouseleave', () => { settingsBtn.style.borderColor = 'rgba(255,255,255,0.15)'; settingsBtn.style.color = '#888'; });
 document.body.appendChild(settingsBtn);
 
 const settingsPanel = document.createElement('div');
 settingsPanel.style.cssText = `
-  position: fixed; top: 60px; right: 16px; width: 260px;
+  position: fixed; top: calc(64px + env(safe-area-inset-top)); right: calc(16px + env(safe-area-inset-right)); width: min(300px, calc(100vw - 32px - env(safe-area-inset-left) - env(safe-area-inset-right)));
   background: rgba(10,10,18,0.92); border: 1px solid rgba(255,255,255,0.1);
-  border-radius: 10px; padding: 16px; z-index: 100; pointer-events: all;
+  border-radius: 10px; padding: 16px; z-index: 10000; pointer-events: all;
   font-family: 'Inter', sans-serif; color: rgba(255,255,255,0.6); font-size: 12px;
   display: none; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
-  max-height: calc(100vh - 80px); overflow-y: auto;
+  max-height: calc(100dvh - 96px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 `;
+settingsPanel.dataset.gameUi = 'true';
 document.body.appendChild(settingsPanel);
 
 let settingsOpen = false;
 function toggleSettings() {
   settingsOpen = !settingsOpen;
-  settingsBtn.style.display = settingsOpen ? 'flex' : 'none';
   settingsPanel.style.display = settingsOpen ? 'block' : 'none';
   settingsBtn.style.background = settingsOpen ? 'rgba(255,255,255,0.08)' : 'rgba(10,10,18,0.8)';
 }
-settingsBtn.addEventListener('click', toggleSettings);
+let lastSettingsToggleAt = 0;
+function handleSettingsToggle(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  const now = performance.now();
+  if (now - lastSettingsToggleAt < 250) return;
+  lastSettingsToggleAt = now;
+  unlockAudio();
+  toggleSettings();
+}
+settingsBtn.addEventListener('pointerup', handleSettingsToggle);
+settingsBtn.addEventListener('touchend', handleSettingsToggle, { passive: false });
+settingsBtn.addEventListener('click', handleSettingsToggle);
 window.addEventListener('keydown', (e) => {
   if (e.key === 'p' || e.key === 'P') toggleSettings();
 });
@@ -898,6 +1074,26 @@ function createToggle(parent, label, value, onChange) {
   return { setState: (v) => { state = v; toggle.style.background = v ? 'rgba(34,153,255,0.6)' : 'rgba(255,255,255,0.1)'; knob.style.left = v ? '18px' : '2px'; } };
 }
 
+function createButtonRow(parent, label, buttonText, onClick) {
+  const row = document.createElement('div');
+  row.style.cssText = 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;';
+  const lbl = document.createElement('span');
+  lbl.style.cssText = 'color: #aaa; font-size: 11px;';
+  lbl.textContent = label;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.style.cssText = `
+    color: #fff; background: rgba(34,153,255,0.28); border: 1px solid rgba(34,153,255,0.45);
+    border-radius: 6px; padding: 6px 10px; font-size: 11px; cursor: pointer;
+  `;
+  button.textContent = buttonText;
+  button.addEventListener('click', onClick);
+  row.appendChild(lbl);
+  row.appendChild(button);
+  parent.appendChild(row);
+  return button;
+}
+
 function createColorPicker(parent, label, value, onChange) {
   const row = document.createElement('div');
   row.style.cssText = 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;';
@@ -917,6 +1113,14 @@ function createColorPicker(parent, label, value, onChange) {
   parent.appendChild(row);
   return input;
 }
+
+// --- Audio diagnostics ---
+const audioSec = createSection('Audio');
+createButtonRow(audioSec, 'Output', 'Test Tone', playAudioTestTone);
+audioStatusEl = document.createElement('div');
+audioStatusEl.style.cssText = 'color: rgba(255,255,255,0.45); font-size: 10px; line-height: 1.4; margin-top: 6px;';
+audioSec.appendChild(audioStatusEl);
+updateAudioStatus();
 
 // --- Lighting section ---
 const lightSec = createSection('Lighting');
@@ -1006,7 +1210,7 @@ createSlider(ssrSec, 'Fade', 0, 1, 0.05, 0.9, (v) => { ssrFade.value = v; });
 // Theme definitions — each theme sets player mallet, AI mallet, and rink together
 const themes = [
   {
-    name: 'Arctic',
+    name: '❄️ 北极',
     player: { head: '#1a88ff', rubber: '#0d5fcc', back: '#0a1520' },
     ai: { head: '#ff3355', rubber: '#cc1133', back: '#1a0a0e' },
     table: { surface: '#0a2233', clearcoat: 0.9, roughness: 0.05, metalness: 0.2 },
@@ -1014,7 +1218,7 @@ const themes = [
     accent: '#1a88ff'
   },
   {
-    name: '🔥 Inferno',
+    name: '🔥 地狱',
     player: { head: '#ff4400', rubber: '#cc2200', back: '#220800' },
     ai: { head: '#ffaa00', rubber: '#cc8800', back: '#221a00' },
     table: { surface: '#1a0800', clearcoat: 0.4, roughness: 0.85, metalness: 0.05 },
@@ -1023,7 +1227,7 @@ const themes = [
     inferno: true
   },
   {
-    name: '🪩 Party',
+    name: '🪩 派对',
     player: { head: '#ff00ff', rubber: '#cc00cc', back: '#220022' },
     ai: { head: '#00ffff', rubber: '#00cccc', back: '#002222' },
     table: { surface: '#0a001a', clearcoat: 0.7, roughness: 0.5, metalness: 0.2 },
@@ -1032,7 +1236,7 @@ const themes = [
     party: true
   },
   {
-    name: '👾 Retro',
+    name: '👾 复古',
     player: { head: '#33ff66', rubber: '#22cc44', back: '#0a1a0e' },
     ai: { head: '#ff3333', rubber: '#cc2222', back: '#1a0a0a' },
     table: { surface: '#0a0e0a', clearcoat: 0.1, roughness: 1.0, metalness: 0.0 },
@@ -1041,7 +1245,7 @@ const themes = [
     retro: true
   },
   {
-    name: '🌊 Zen',
+    name: '🌊 禅意',
     player: { head: '#7ab8d4', rubber: '#5a9ec0', back: '#1e2d3d' },
     ai: { head: '#b8a0d4', rubber: '#9a80c0', back: '#241e38' },
     table: { surface: '#0a2e4a', clearcoat: 0.9, roughness: 0.2, metalness: 0.08 },
@@ -3859,39 +4063,79 @@ function applyTheme(idx) {
   if (theme.inferno) startInfernoMode();
 }
 
+function syncThemeCards() {
+  themeCards.forEach((c, i) => {
+    const active = i === currentTheme;
+    c.card.style.borderColor = active ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.08)';
+    c.card.style.background = active ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.5)';
+    c.nameEl.style.color = active ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.3)';
+  });
+}
+
+function selectTheme(idx, announce = false) {
+  applyTheme(idx);
+  syncThemeCards();
+  if (announce) showMessage(`已切换模式：${themes[idx].name}`, 1200);
+}
+
+function cycleThemeByGesture() {
+  const nextTheme = (currentTheme + 1) % themes.length;
+  selectTheme(nextTheme, true);
+}
+
 // --- Theme Buttons (always visible) ---
 
 const themesPanel = document.createElement('div');
+themesPanel.id = 'themesPanel';
+themesPanel.dataset.gameUi = 'true';
 themesPanel.style.cssText = `
-  position: fixed; bottom: 56px; left: 0; width: 100%;
-  padding: 0; z-index: 150; pointer-events: none;
+  position: fixed; bottom: calc(64px + env(safe-area-inset-bottom)); left: 0; width: 100%;
+  padding: 0; z-index: 150; pointer-events: auto;
   font-family: 'Inter', sans-serif; color: rgba(255,255,255,0.6); font-size: 12px;
   display: flex;
   overflow: hidden;
   background: transparent;
+  touch-action: pan-x;
 `;
 document.body.appendChild(themesPanel);
 
 // Theme cards container
 const themesBody = document.createElement('div');
+themesBody.id = 'themesBody';
 themesBody.style.cssText = `
   display: flex; justify-content: center; align-items: center; gap: 8px;
-  padding: 12px 24px 14px; overflow-x: auto; width: 100%; pointer-events: none;
+  padding: 12px max(16px, env(safe-area-inset-right)) 14px max(16px, env(safe-area-inset-left));
+  overflow-x: auto; overflow-y: hidden; width: 100%; pointer-events: auto;
+  scrollbar-width: none; -webkit-overflow-scrolling: touch;
+  touch-action: pan-x;
 `;
 themesPanel.appendChild(themesBody);
+
+const mobileUiStyle = document.createElement('style');
+mobileUiStyle.textContent = `
+  #themesBody::-webkit-scrollbar { display: none; }
+  @media (max-width: 520px) {
+    #themesBody { justify-content: flex-start !important; gap: 6px !important; }
+  }
+`;
+document.head.appendChild(mobileUiStyle);
 
 const themeCards = [];
 themes.forEach((theme, idx) => {
   const card = document.createElement('div');
   const isActive = idx === 0;
+  let themePointerStartX = 0;
+  let themePointerStartY = 0;
+  let themeWasDragged = false;
   card.style.cssText = `
     display: flex; flex-direction: column; align-items: center; gap: 6px;
-    cursor: pointer; pointer-events: all; flex-shrink: 0;
-    padding: 8px 12px; border-radius: 10px;
+    cursor: pointer; pointer-events: all; flex: 0 0 clamp(86px, 23vw, 116px);
+    min-width: 0; padding: 8px 10px; border-radius: 8px;
     border: 1px solid ${isActive ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.08)'};
     background: ${isActive ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.5)'};
     backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
     transition: border-color 0.25s, background 0.25s, transform 0.15s;
+    touch-action: pan-x;
   `;
 
   // Theme name
@@ -3900,6 +4144,7 @@ themes.forEach((theme, idx) => {
     font-family: 'Instrument Serif', serif; font-style: italic; font-size: 11px;
     color: ${isActive ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.3)'};
     letter-spacing: 0.3px; white-space: nowrap; transition: color 0.25s;
+    overflow: hidden; text-overflow: ellipsis; max-width: 100%;
   `;
   nameEl.textContent = theme.name;
   card.appendChild(nameEl);
@@ -3913,15 +4158,21 @@ themes.forEach((theme, idx) => {
     if (idx !== currentTheme) card.style.borderColor = 'rgba(255,255,255,0.05)';
   });
 
+  card.addEventListener('pointerdown', (event) => {
+    themePointerStartX = event.clientX;
+    themePointerStartY = event.clientY;
+    themeWasDragged = false;
+  });
+  card.addEventListener('pointermove', (event) => {
+    const dx = Math.abs(event.clientX - themePointerStartX);
+    const dy = Math.abs(event.clientY - themePointerStartY);
+    if (dx > 8 && dx > dy) themeWasDragged = true;
+  });
+
   card.addEventListener('click', () => {
-    applyTheme(idx);
-    // Update all cards
-    themeCards.forEach((c, i) => {
-      const active = i === idx;
-      c.card.style.borderColor = active ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.08)';
-      c.card.style.background = active ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.5)';
-      c.nameEl.style.color = active ? 'rgba(255,255,255,0.7)' : 'rgba(255,255,255,0.3)';
-    });
+    if (themeWasDragged) return;
+    unlockAudio();
+    selectTheme(idx);
   });
 
   themesBody.appendChild(card);
@@ -3980,14 +4231,14 @@ scoreDiv.innerHTML = `
   <div style="display:flex;flex-direction:column;align-items:center;gap:4px;justify-self:end;padding-right:24px;">
     <div style="display:flex;align-items:center;gap:12px;">
       <span id="playerServeDot" style="width:8px;height:8px;border-radius:50%;background:#1a88ff;display:none;animation:servePulse 1.2s ease-in-out infinite;flex-shrink:0;"></span>
-      <span style="color:#1a88ff;font-family:'Instrument Serif',serif;font-size:22px;font-style:italic;letter-spacing:0.5px;">You</span>
+      <span style="color:#1a88ff;font-family:'Instrument Serif',serif;font-size:22px;font-style:italic;letter-spacing:0.5px;">你</span>
       <span id="playerScore" style="color:#fff;font-family:'Instrument Serif',serif;font-size:48px;line-height:1;min-width:56px;text-align:center;font-variant-numeric:tabular-nums;">0</span>
     </div>
     <div id="playerSets" style="display:flex;gap:6px;"></div>
   </div>
   <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;width:80px;">
-    <div style="color:rgba(255,255,255,0.2);font-family:'Instrument Serif',serif;font-size:26px;font-style:italic;">vs</div>
-    <div id="setLabel" style="color:rgba(255,255,255,0.2);font-family:'Instrument Serif',serif;font-size:13px;font-style:italic;letter-spacing:0.5px;white-space:nowrap;">Game 1</div>
+    <div style="color:rgba(255,255,255,0.2);font-family:'Instrument Serif',serif;font-size:26px;font-style:italic;">对战</div>
+    <div id="setLabel" style="color:rgba(255,255,255,0.2);font-family:'Instrument Serif',serif;font-size:13px;font-style:italic;letter-spacing:0.5px;white-space:nowrap;">第 1 局</div>
   </div>
   <div style="display:flex;flex-direction:column;align-items:center;gap:4px;justify-self:start;padding-left:24px;">
     <div style="display:flex;align-items:center;gap:12px;">
@@ -4026,35 +4277,157 @@ infoDiv.style.cssText = `
   text-align: center; padding: 10px; color: rgba(255,255,255,0.35); font-size: 14px;
   font-family: 'Instrument Serif', serif; font-style: italic; letter-spacing: 0.5px;
 `;
-infoDiv.textContent = 'Space / Tap to drop puck · Mouse / WASD to move';
+infoDiv.textContent = '空格 / 轻触 / 举右手发球 · 手势 / 鼠标 / WASD 移动 · 握拳切换模式';
 uiContainer.appendChild(infoDiv);
+
+const gesturePreviewPanel = document.createElement('div');
+gesturePreviewPanel.dataset.gameUi = 'true';
+gesturePreviewPanel.style.cssText = `
+  position: fixed; top: calc(72px + env(safe-area-inset-top)); left: calc(16px + env(safe-area-inset-left));
+  z-index: 10001; width: clamp(160px, 18vw, 250px); pointer-events: none;
+  border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; overflow: hidden;
+  background: rgba(10,10,18,0.72); box-shadow: 0 12px 28px rgba(0,0,0,0.34);
+  font-family: 'Inter', sans-serif; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+`;
+document.body.appendChild(gesturePreviewPanel);
+
+const gesturePreviewViewport = document.createElement('div');
+gesturePreviewViewport.style.cssText = `
+  position: relative; width: 100%; aspect-ratio: 4 / 3; overflow: hidden;
+  background: radial-gradient(circle at center, rgba(80,120,160,0.22), rgba(0,0,0,0.52));
+`;
+gesturePreviewViewport.innerHTML = `
+  <div style="position:absolute;inset:0;display:grid;place-items:center;color:rgba(255,255,255,0.36);font-size:11px;letter-spacing:0.2px;text-align:center;padding:12px;">
+    摄像头预览
+  </div>
+`;
+gesturePreviewPanel.appendChild(gesturePreviewViewport);
+
+const gestureStatusDiv = document.createElement('div');
+gestureStatusDiv.style.cssText = `
+  padding: 7px 9px; min-height: 28px; border-top: 1px solid rgba(255,255,255,0.09);
+  color: rgba(255,255,255,0.58); font-size: 11px; line-height: 1.25; letter-spacing: 0.2px;
+`;
+gestureStatusDiv.textContent = '手势：正在打开摄像头';
+gesturePreviewPanel.appendChild(gestureStatusDiv);
+
+const interactionModeControl = document.createElement('div');
+interactionModeControl.style.cssText = `
+  display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 0 8px 8px;
+  pointer-events: all;
+`;
+gesturePreviewPanel.appendChild(interactionModeControl);
+
+function createModeButton(label, mode) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  button.dataset.gameUi = 'true';
+  button.style.cssText = `
+    height: 28px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px;
+    background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.62);
+    font-family: 'Inter', sans-serif; font-size: 11px; cursor: pointer;
+    -webkit-appearance: none; appearance: none; touch-action: manipulation;
+  `;
+  button.addEventListener('pointerup', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setInteractionMode(mode);
+  });
+  interactionModeControl.appendChild(button);
+  return button;
+}
+
+let gestureModeBtn = null;
+let mouseModeBtn = null;
+
+function updateInteractionModeButtons() {
+  if (!gestureModeBtn || !mouseModeBtn) return;
+  const activeStyle = 'rgba(140,255,210,0.16)';
+  const inactiveStyle = 'rgba(255,255,255,0.05)';
+  gestureModeBtn.style.background = interactionMode === 'gesture' ? activeStyle : inactiveStyle;
+  gestureModeBtn.style.color = interactionMode === 'gesture' ? 'rgba(180,255,225,0.92)' : 'rgba(255,255,255,0.62)';
+  gestureModeBtn.style.borderColor = interactionMode === 'gesture' ? 'rgba(140,255,210,0.34)' : 'rgba(255,255,255,0.12)';
+  mouseModeBtn.style.background = interactionMode === 'mouse' ? activeStyle : inactiveStyle;
+  mouseModeBtn.style.color = interactionMode === 'mouse' ? 'rgba(180,255,225,0.92)' : 'rgba(255,255,255,0.62)';
+  mouseModeBtn.style.borderColor = interactionMode === 'mouse' ? 'rgba(140,255,210,0.34)' : 'rgba(255,255,255,0.12)';
+}
+
+function setInteractionMode(mode) {
+  interactionMode = mode === 'mouse' ? 'mouse' : 'gesture';
+  useMouseControl = true;
+  syncAnalogControlPoint();
+  updateInteractionModeButtons();
+  showMessage(interactionMode === 'gesture' ? '已切换为手势控制' : '已切换为鼠标控制', 900);
+}
+
+gestureModeBtn = createModeButton('手势', 'gesture');
+mouseModeBtn = createModeButton('鼠标', 'mouse');
+updateInteractionModeButtons();
+
+const gestureHintDiv = document.createElement('div');
+gestureHintDiv.style.cssText = `
+  padding: 0 9px 8px; color: rgba(255,255,255,0.42); font-size: 10px;
+  line-height: 1.35; letter-spacing: 0.2px;
+`;
+gestureHintDiv.textContent = '举右手确认，握拳切换模式';
+gesturePreviewPanel.appendChild(gestureHintDiv);
+
+function updateGestureStatus(status) {
+  if (!status) return;
+  gestureStatusDiv.textContent = status.message || `手势：${status.code}`;
+  const active = status.code === 'ready' || status.code === 'confirmed';
+  const warning = status.code === 'permission-denied' || status.code === 'no-camera' || status.code === 'error';
+  gestureStatusDiv.style.color = active ? 'rgba(140,255,210,0.78)' : warning ? 'rgba(255,170,150,0.76)' : 'rgba(255,255,255,0.58)';
+  gesturePreviewPanel.style.borderColor = active ? 'rgba(140,255,210,0.26)' : warning ? 'rgba(255,170,150,0.22)' : 'rgba(255,255,255,0.12)';
+}
+
+createGestureInput({
+  onPoint: ({ x, y }) => {
+    setControlPoint(x, y, 'gesture');
+  },
+  onConfirm: () => {
+    if (interactionMode !== 'gesture') return;
+    unlockAudio();
+    if (runPrimaryGameAction()) showMessage('手势已确认', 900);
+  },
+  onFist: () => {
+    if (interactionMode !== 'gesture') return;
+    unlockAudio();
+    cycleThemeByGesture();
+  },
+  onStatus: updateGestureStatus,
+  previewContainer: gesturePreviewViewport
+});
 
 // Point notification sits below the serve info
 uiContainer.appendChild(pointNotif);
 
 // Stats bar at bottom
 const statsBar = document.createElement('div');
+statsBar.dataset.gameUi = 'true';
 statsBar.style.cssText = `
   position: fixed; bottom: 0; left: 0; width: 100%; pointer-events: none;
   font-family: 'Instrument Serif', serif; z-index: 10; box-sizing: border-box;
-  display: flex; justify-content: center; align-items: flex-end; gap: 32px; padding: 14px 24px;
+  display: flex; justify-content: space-between; align-items: flex-end; gap: clamp(4px, 2vw, 20px);
+  padding: 10px max(8px, env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
   background: linear-gradient(transparent, rgba(0,0,0,0.6));
 `;
 
 function createStatItem(label, id, initialValue) {
   const item = document.createElement('div');
-  item.style.cssText = 'display: flex; flex-direction: column; align-items: center; gap: 2px;';
+  item.style.cssText = 'display: flex; flex: 1 1 0; min-width: 0; flex-direction: column; align-items: center; gap: 2px;';
   const valueEl = document.createElement('div');
   valueEl.id = id;
   valueEl.style.cssText = `
-    color: rgba(255,255,255,0.85); font-size: 20px; font-style: italic;
-    line-height: 1; letter-spacing: 0.5px;
+    color: rgba(255,255,255,0.85); font-size: clamp(14px, 4vw, 20px); font-style: italic;
+    line-height: 1; letter-spacing: 0.3px; white-space: nowrap;
   `;
   valueEl.textContent = initialValue;
   const labelEl = document.createElement('div');
   labelEl.style.cssText = `
-    color: rgba(255,255,255,0.25); font-size: 11px; font-style: italic;
-    letter-spacing: 1px; font-family: 'Inter', sans-serif;
+    color: rgba(255,255,255,0.25); font-size: clamp(8px, 2.45vw, 11px); font-style: italic;
+    letter-spacing: 0.2px; font-family: 'Inter', sans-serif; white-space: nowrap;
   `;
   labelEl.textContent = label;
   item.appendChild(valueEl);
@@ -4135,7 +4508,7 @@ function showMessage(text, duration = 1500) {
 let pointNotifTimeout = null;
 function showPointNotif(text, duration = 2200) {
   // Determine color based on scorer — use active theme colors
-  const isPlayer = text.includes('You');
+  const isPlayer = text.includes('你');
   const accentColor = isPlayer ? activePlayerColor : activeAiColor;
   _tmpColor.set(accentColor);
   const glowColor = `rgba(${Math.round(_tmpColor.r*255)},${Math.round(_tmpColor.g*255)},${Math.round(_tmpColor.b*255)},0.4)`;
@@ -4149,8 +4522,8 @@ function showPointNotif(text, duration = 2200) {
   pointNotif.style.textShadow = `0 0 30px ${glowColor}, 0 0 60px ${glowColor}`;
 
   // Build inner HTML — single line with dash separator
-  const scorerName = isPlayer ? 'You' : 'CPU';
-  pointNotif.innerHTML = `<span style="font-size:38px;letter-spacing:1px;">Goal — ${scorerName}</span>`;
+  const scorerName = isPlayer ? '你' : 'CPU';
+  pointNotif.innerHTML = `<span style="font-size:38px;letter-spacing:1px;">进球 — ${scorerName}</span>`;
 
   // Trigger entrance
   requestAnimationFrame(() => {
@@ -4189,9 +4562,9 @@ function updateScoreDisplay() {
 function updateSetDisplay() {
   const setLabel = document.getElementById('setLabel');
   if (gameState.matchOver) {
-    setLabel.textContent = 'Series Over';
+    setLabel.textContent = '系列赛结束';
   } else {
-    setLabel.textContent = `Game ${gameState.currentSet}`;
+    setLabel.textContent = `第 ${gameState.currentSet} 局`;
   }
 
   // Render set pips for each side
@@ -4226,10 +4599,10 @@ function startNextSet() {
     gameState.paused = true;
     gameState.waitingForPlayerServe = true;
     positionBallOnPaddle();
-    showMessage(`Game ${gameState.currentSet} — Your drop`, 2000);
+    showMessage(`第 ${gameState.currentSet} 局 — 你发球`, 2000);
   } else {
     gameState.paused = true;
-    showMessage(`Game ${gameState.currentSet} — CPU drops`, 2000);
+    showMessage(`第 ${gameState.currentSet} 局 — CPU 发球`, 2000);
     setTimeout(() => serve(), 1500);
   }
 }
@@ -4259,7 +4632,7 @@ function scorePoint(scorer) {
     stats.playerStreak++;
     stats.aiStreak = 0;
     if (stats.playerStreak > stats.bestStreak) stats.bestStreak = stats.playerStreak;
-    showPointNotif('Goal — You');
+    showPointNotif('进球 — 你');
     triggerScreenFlash(true);
   } else {
     gameState.aiScore++;
@@ -4267,7 +4640,7 @@ function scorePoint(scorer) {
     stats.aiStreak++;
     stats.playerStreak = 0;
     if (stats.aiStreak > stats.bestStreak) stats.bestStreak = stats.aiStreak;
-    showPointNotif('Goal — CPU');
+    showPointNotif('进球 — CPU');
     triggerScreenFlash(false);
   }
   updateScoreDisplay();
@@ -4291,25 +4664,25 @@ function scorePoint(scorer) {
     // Check match win
     if (gameState.playerSets >= SETS_TO_WIN) {
       gameState.matchOver = true;
-      showMessage('You Win the Series!', 4000);
+      showMessage('你赢得系列赛！', 4000);
       updateSetDisplay();
       setTimeout(() => {
-        infoDiv.textContent = 'Press space or tap for a new series';
+        infoDiv.textContent = '按空格、轻触或举右手开始新系列赛';
       }, 500);
     } else if (gameState.aiSets >= SETS_TO_WIN) {
       gameState.matchOver = true;
-      showMessage('CPU Wins the Series!', 4000);
+      showMessage('CPU 赢得系列赛！', 4000);
       updateSetDisplay();
       setTimeout(() => {
-        infoDiv.textContent = 'Press space or tap for a new series';
+        infoDiv.textContent = '按空格、轻触或举右手开始新系列赛';
       }, 500);
     } else {
       // Set won but match continues
-      const setWinner = ps > as ? 'You' : 'CPU';
+      const setWinner = ps > as ? '你' : 'CPU';
       gameState.currentSet++;
-      showMessage(`${setWinner} win${ps > as ? '' : 's'} Game ${gameState.currentSet - 1}!`, 2500);
+      showMessage(`${setWinner}赢下第 ${gameState.currentSet - 1} 局！`, 2500);
       setTimeout(() => {
-        infoDiv.textContent = 'Press space or tap for next game';
+        infoDiv.textContent = '按空格、轻触或举右手进入下一局';
       }, 500);
     }
   }
@@ -4624,10 +4997,11 @@ function updateTrail() {
 }
 
 // Audio context for edge/corner sound cues
-let audioCtx = null;
 function getAudioCtx() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx.onstatechange = () => updateAudioStatus('state');
+    updateAudioStatus('created');
   }
   return audioCtx;
 }
@@ -4794,6 +5168,7 @@ const clock = new THREE.Clock();
 function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
 
+  syncAnalogControlPoint();
   updatePlayer(dt);
   updateAI(dt);
 
@@ -4959,19 +5334,25 @@ function animateWithFPS(time) {
 renderer.setAnimationLoop(animateWithFPS);
 
 // Handle resize
-window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
+function resizeRendererToViewport() {
+  const { width, height } = getViewportSize();
+  camera.aspect = width / height;
   camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, getMaxPixelRatio()));
+  renderer.setSize(width, height);
+}
+
+window.addEventListener('resize', resizeRendererToViewport);
+window.visualViewport?.addEventListener('resize', resizeRendererToViewport);
+window.visualViewport?.addEventListener('scroll', resizeRendererToViewport);
 
 // Update serve indicator text
 function updateServeIndicator() {
   if (gameState.gameOver) return;
   if (gameState.serverIsPlayer) {
-    infoDiv.textContent = 'Your drop — click or press space';
+    infoDiv.textContent = '你发球 — 点击、按空格或举右手';
   } else {
-    infoDiv.textContent = 'CPU dropping puck…';
+    infoDiv.textContent = 'CPU 发球中...';
   }
   updateServeDots();
 }
@@ -4991,6 +5372,6 @@ function positionBallOnPaddle() {
 
 positionBallOnPaddle();
 updateSetDisplay();
-showMessage('Click or tap to drop the puck', 3000);
+showMessage('点击、轻触或举右手发球', 3000);
 updateServeIndicator();
 updateServeDots();
